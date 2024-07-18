@@ -60,6 +60,32 @@ def unzip_file(zip_path, extract_to):
         for dir in dirs:
             os.rmdir(os.path.join(root, dir))
 
+    # Handle csv and txt files
+    handle_files(extract_to, os.path.join(extract_to, '../metadata'))
+
+def handle_files(images_dir, metadata_dir):
+    for root, dirs, files in os.walk(images_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if file.endswith('.csv'):
+                move_file(file_path, metadata_dir)
+            elif file.endswith('.txt'):
+                os.remove(file_path)
+
+def move_file(file_path, metadata_dir):
+    base_name = os.path.basename(file_path)
+    new_file_path = os.path.join(metadata_dir, base_name)
+    
+    # Rename file if it already exists
+    if os.path.exists(new_file_path):
+        base, ext = os.path.splitext(base_name)
+        counter = 1
+        while os.path.exists(new_file_path):
+            new_file_path = os.path.join(metadata_dir, f"{base}{counter}{ext}")
+            counter += 1
+    
+    shutil.move(file_path, new_file_path)
+
 def main():
     base_dir = 'data'
 
@@ -95,7 +121,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Placeholder for combining files later
-# def combine_files():
-#     pass
