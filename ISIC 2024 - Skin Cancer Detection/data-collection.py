@@ -3,6 +3,7 @@ import requests
 from zipfile import ZipFile
 import shutil
 import pandas as pd
+from PIL import Image
 
 # URLs and file paths
 data_files = {
@@ -159,6 +160,39 @@ def remove_duplicates(base_dir='data'):
     print(f"Total removed entries: {len(removed_entries)}")
     return removed_entries
 
+def crop_resize_images(base_dir = 'data'):
+    years = ["2019", "2020"]
+
+    for year in years:
+        images_directory = os.path.join(base_dir, year, "images")
+        
+        # Process each image in the directory
+        for file in os.listdir(images_directory):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                image_path = os.path.join(images_directory, file)
+                
+                with Image.open(image_path) as img:
+                    # Get the dimensions of the image
+                    width, height = img.size
+
+                    # Calculate the size of the square (it will be the smallest dimension)
+                    square_size = min(width, height)
+
+                    # Calculate the coordinates for the center crop
+                    left = (width - square_size) / 2
+                    top = 0
+                    right = (width + square_size) / 2
+                    bottom = height
+
+                    # Crop the image
+                    img_cropped = img.crop((left, top, right, bottom))
+
+                    # Resize the cropped image to 127x127
+                    img_resized = img_cropped.resize((127, 127), Image.ANTIALIAS)
+
+                    # Overwrite the original image with the resized image
+                    img_resized.save(image_path)
+
 def main():
     base_dir = 'data'
 
@@ -197,3 +231,6 @@ if __name__ == "__main__":
     rename_and_cleanup_files()
     combine_metadata()
     remove_duplicates()
+    crop_resize_images()
+
+    #Consider adding download to resnet weights file here and move to './data/resnet.pth'
