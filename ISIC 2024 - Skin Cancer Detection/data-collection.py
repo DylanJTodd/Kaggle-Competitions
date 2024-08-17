@@ -2,21 +2,10 @@ import os
 import requests
 from zipfile import ZipFile
 import shutil
+import pandas as pd
 
 # URLs and file paths
 data_files = {
-    "2016": [
-        ("images/images.zip", "https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part3_Training_Data.zip"),
-        ("metadata/ground_truth.csv", "https://isic-challenge-data.s3.amazonaws.com/2016/ISBI2016_ISIC_Part3_Training_GroundTruth.csv"),
-    ],
-    "2017": [
-        ("images/images.zip", "https://isic-challenge-data.s3.amazonaws.com/2017/ISIC-2017_Training_Data.zip"),
-        ("metadata/ground_truth.csv", "https://isic-challenge-data.s3.amazonaws.com/2017/ISIC-2017_Training_Part3_GroundTruth.csv"),
-    ],
-    "2018": [
-        ("images/images.zip", "https://isic-challenge-data.s3.amazonaws.com/2018/ISIC2018_Task3_Training_Input.zip"),
-        ("metadata/lesion_groupings.csv", "https://isic-challenge-data.s3.amazonaws.com/2018/ISIC2018_Task3_Training_GroundTruth.zip"),
-    ],
     "2019": [
         ("images/images.zip", "https://isic-challenge-data.s3.amazonaws.com/2019/ISIC_2019_Training_Input.zip"),
         ("metadata/metadata.csv", "https://isic-challenge-data.s3.amazonaws.com/2019/ISIC_2019_Training_Metadata.csv"),
@@ -86,6 +75,90 @@ def move_file(file_path, metadata_dir):
     
     shutil.move(file_path, new_file_path)
 
+def rename_and_cleanup_files(base_dir='data'):
+    for year in os.listdir(base_dir):
+        year_images_dir = os.path.join(base_dir, year, 'images')
+        year_metadata_dir = os.path.join(base_dir, year, 'metadata')
+
+        if year == '2019':
+            if os.path.exists(year_images_dir):
+                for img_file in os.listdir(year_images_dir):
+                    if img_file.endswith('_downsampled.jpg'):
+                        new_name = img_file.replace('_downsampled', '')
+                        os.rename(os.path.join(year_images_dir, img_file), os.path.join(year_images_dir, new_name))
+                        print(f"Renamed image {img_file} to {new_name} in {year} images folder.")
+
+            if os.path.exists(year_metadata_dir):
+                metadata_file = os.path.join(year_metadata_dir, 'metadata.csv')
+                if os.path.exists(metadata_file):
+                    df = pd.read_csv(metadata_file)
+                    df[0] = df[0].str.replace('_downsampled', '')
+                    df.to_csv(metadata_file, index=False)
+                    print(f"Removed '_downsampled' from isic_id in {year} metadata.")
+
+def combine_metadata(base_dir='data'):
+    for year in os.listdir(base_dir):
+        year_dir = os.path.join(base_dir, year, 'metadata')
+        
+        if os.path.exists(year_dir) and os.path.isdir(year_dir):
+            csv_files = [f for f in os.listdir(year_dir) if f.endswith('.csv') and f != 'metadata.csv']
+            
+            if len(csv_files) == 0:
+                print(f"No CSV files found for {year}.")
+                continue
+            
+            combined_df = pd.DataFrame()
+
+            for i, csv_file in enumerate(csv_files):
+                csv_path = os.path.join(year_dir, csv_file)
+                df = pd.read_csv(csv_path, header=None if year == '2016' else 0)
+                df.columns = ['isic_id'] + list(df.columns[1:]) if year != '2016' else ['isic_id', 'MEL']
+                
+                if i == 0:
+                    combined_df = df
+                else:
+                    combined_df = pd.concat([combined_df, df.drop(columns=['isic_id'])], axis=1)
+
+            combined_csv_path = os.path.join(year_dir, 'metadata.csv')
+            combined_df.to_csv(combined_csv_path, index=False)
+            print(f"Combined CSV files into {combined_csv_path}.")
+
+            for csv_file in csv_files:
+                os.remove(os.path.join(year_dir, csv_file))
+
+def remove_duplicates(base_dir='data'):
+    isic_id_set = set()
+    years = ['2024', '2020', '2019']  # process years in reverse order
+    removed_entries = []
+
+    for year in years:
+        year_dir = os.path.join(base_dir, year)
+        metadata_file = os.path.join(year_dir, 'metadata', 'metadata.csv')
+        images_dir = os.path.join(year_dir, 'images')
+        
+        if os.path.exists(metadata_file):
+            df = pd.read_csv(metadata_file)
+            
+            rows_to_drop = []
+            for index, row in df.iterrows():
+                isic_id = row['isic_id']
+                if isic_id in isic_id_set:
+                    rows_to_drop.append(index)
+                    img_file = os.path.join(images_dir, f"{isic_id}.jpg")
+                    if os.path.exists(img_file):
+                        os.remove(img_file)
+                        removed_entries.append((year, isic_id, 'image'))
+                else:
+                    isic_id_set.add(isic_id)
+
+            df.drop(rows_to_drop, inplace=True)
+            df.to_csv(metadata_file, index=False)
+            removed_entries.extend([(year, isic_id, 'metadata') for index in rows_to_drop])
+            print(f"Processed duplicates for {year}.")
+
+    print(f"Total removed entries: {len(removed_entries)}")
+    return removed_entries
+
 def main():
     base_dir = 'data'
 
@@ -121,3 +194,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    rename_and_cleanup_files()
+    combine_metadata()
+    remove_duplicates()
