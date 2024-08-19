@@ -93,39 +93,55 @@ def rename_and_cleanup_files(base_dir='data'):
                 metadata_file = os.path.join(year_metadata_dir, 'metadata.csv')
                 if os.path.exists(metadata_file):
                     df = pd.read_csv(metadata_file)
-                    df[0] = df[0].str.replace('_downsampled', '')
+                    df['image'] = df['image'].str.replace('_downsampled', '')
                     df.to_csv(metadata_file, index=False)
                     print(f"Removed '_downsampled' from isic_id in {year} metadata.")
-
+                    
 def combine_metadata(base_dir='data'):
-    for year in os.listdir(base_dir):
-        year_dir = os.path.join(base_dir, year, 'metadata')
+    # Mapping of year to their respective Column A name
+    column_a_mapping = {
+        '2019': 'image',
+        '2020': 'image_name',
+        '2024': 'isic_id'
+    }
+
+    # Iterate through each year folder
+    for year in ['2019', '2020', '2024']:
+        metadata_dir = os.path.join(base_dir, year, 'metadata')
         
-        if os.path.exists(year_dir) and os.path.isdir(year_dir):
-            csv_files = [f for f in os.listdir(year_dir) if f.endswith('.csv') and f != 'metadata.csv']
+        combined_df = None
+        
+        # Iterate through each metadata file in the metadata directory
+        for file_name in os.listdir(metadata_dir):
+            file_path = os.path.join(metadata_dir, file_name)
             
-            if len(csv_files) == 0:
-                print(f"No CSV files found for {year}.")
-                continue
+            # Read the metadata file into a DataFrame
+            df = pd.read_csv(file_path)
             
-            combined_df = pd.DataFrame()
-
-            for i, csv_file in enumerate(csv_files):
-                csv_path = os.path.join(year_dir, csv_file)
-                df = pd.read_csv(csv_path, header=None if year == '2016' else 0)
-                df.columns = ['isic_id'] + list(df.columns[1:]) if year != '2016' else ['isic_id', 'MEL']
-                
-                if i == 0:
-                    combined_df = df
-                else:
-                    combined_df = pd.concat([combined_df, df.drop(columns=['isic_id'])], axis=1)
-
-            combined_csv_path = os.path.join(year_dir, 'metadata.csv')
-            combined_df.to_csv(combined_csv_path, index=False)
-            print(f"Combined CSV files into {combined_csv_path}.")
-
-            for csv_file in csv_files:
-                os.remove(os.path.join(year_dir, csv_file))
+            # Rename the 0th column to 'isic_id'
+            column_a_name = column_a_mapping[year]
+            df = df.rename(columns={column_a_name: 'isic_id'})
+            
+            # For 2019, remove the '_downsampled' suffix from 'isic_id'
+            if year == '2019':
+                df['isic_id'] = df['isic_id'].str.replace('_downsampled', '')
+            
+            # If this is the first file, initialize combined_df with it
+            if combined_df is None:
+                combined_df = df
+            else:
+                # Merge based on 'isic_id' with an outer join
+                combined_df = pd.merge(combined_df, df, on='isic_id', how='outer')
+        
+        # Save the combined DataFrame as metadata.csv in the respective metadata folder
+        output_file_path = os.path.join(metadata_dir, 'metadata.csv')
+        combined_df.to_csv(output_file_path, index=False)
+        
+        # Remove the original metadata files after combining them
+        for file_name in os.listdir(metadata_dir):
+            if file_name != 'metadata.csv':  # Keep the newly created metadata.csv
+                file_path = os.path.join(metadata_dir, file_name)
+                os.remove(file_path)
 
 def remove_duplicates(base_dir='data'):
     isic_id_set = set()
@@ -188,10 +204,97 @@ def crop_resize_images(base_dir = 'data'):
                     img_cropped = img.crop((left, top, right, bottom))
 
                     # Resize the cropped image to 127x127
-                    img_resized = img_cropped.resize((127, 127), Image.ANTIALIAS)
+                    img_resized = img_cropped.resize((127, 127), Image.Resampling.LANCZOS)
 
                     # Overwrite the original image with the resized image
                     img_resized.save(image_path)
+
+import os
+import pandas as pd
+import numpy as np
+
+def adjusting_metadata(base_dir='data'):
+    anatom_site_general_encoding = {}
+    encoding_counter = 0
+
+    for year in os.listdir(base_dir):
+        year_dir = os.path.join(base_dir, year, 'metadata')
+        metadata_file = os.path.join(year_dir, 'metadata.csv')
+        
+        if os.path.exists(metadata_file):
+            df = pd.read_csv(metadata_file, header=None if year == '2016' else 0)
+            df.columns = ['isic_id'] + list(df.columns[1:]) if year != '2016' else ['isic_id', 'MEL']
+            
+            try:
+                if year == '2019':
+                    try:
+                        df = df.drop(columns=['NV', 'AK', 'BKL', 'VASC', 'UNK', 'lesion_id'])
+                    except Exception as e:
+                        print(f"Error dropping columns for {year}: {e}")
+                    try:
+                        for value in df['anatom_site_general'].unique():
+                            if value not in anatom_site_general_encoding:
+                                anatom_site_general_encoding[value] = encoding_counter
+                                encoding_counter += 1
+                        df['anatom_site_general'] = df['anatom_site_general'].map(anatom_site_general_encoding)
+                        df['sex'] = df['sex'].map({'male': 0, 'female': 1})
+                        df['malignant'] = df[['MEL', 'BCC', 'SCC']].max(axis=1)
+                        df = df[['isic_id', 'age_approx', 'sex', 'anatom_site_general', 'malignant']]
+                    except Exception as e:
+                        print(f"Error encoding columns for {year}: {e}")
+
+                        df = df.replace({np.nan: -1})
+
+                elif year == '2020':
+                    try:
+                        df = df.drop(columns=['patient_id', 'diagnosis', 'benign_malignant', 'patient_id.1', 'sex.1', 'age_approx.1', 'anatom_site_general_challenge.1', 'diagnosis.1', 'benign_malignant.1', 'target.1'])
+                    except Exception as e:
+                        print(f"Error dropping columns for {year}: {e}")
+
+                    try:
+                        df['anatom_site_general_challenge'] = df['anatom_site_general_challenge'].map(anatom_site_general_encoding)
+                        df = df.rename(columns={'anatom_site_general_challenge': 'anatom_site_general', 'target': 'malignant'})
+                        df['sex'] = df['sex'].map({'male': 0, 'female': 1})
+                        df = df[['isic_id', 'age_approx', 'sex', 'anatom_site_general', 'malignant']]
+                    except Exception as e:
+                        print(f"Error encoding columns for {year}: {e}")
+
+                    df = df.replace({np.nan: -1})
+
+
+                elif year == '2024':
+                    try:
+                        columns_to_remove = ['attribution', 'copyright_license', 'lesion_id', 'iddx_full', 'iddx_1', 'iddx_2', 'iddx_3', 'iddx_4', 'iddx_5', 
+                                            'mel_mitotic_index', 'mel_thick_mm', 'tbp_lv_dnn_lesion_confidence', 'patient_id', 'clin_size_long_diam_mm', 
+                                            'image_type', 'tbp_tile_type', 'tbp_lv_A', 'tbp_lv_Aext', 'tbp_lv_B', 'tbp_lv_Bext', 'tbp_lv_C', 'tbp_lv_Cext', 
+                                            'tbp_lv_L', 'tbp_lv_Lext', 'tbp_lv_areaMM2', 'tbp_lv_area_perim_ratio', 'tbp_lv_deltaA', 'tbp_lv_deltaB', 
+                                            'tbp_lv_deltaL', 'tbp_lv_eccentricity', 'tbp_lv_location', 'tbp_lv_location_simple', 'tbp_lv_minorAxisMM', 
+                                            'tbp_lv_nevi_confidence', 'tbp_lv_norm_border', 'tbp_lv_radial_color_std_max', 'tbp_lv_stdL', 'tbp_lv_stdLExt', 
+                                            'tbp_lv_symm_2axis', 'tbp_lv_symm_2axis_angle', 'tbp_lv_x', 'tbp_lv_y', 'tbp_lv_z', 'tbp_lv_H', 'tbp_lv_Hext', 'tbp_lv_color_std_mean',
+                                            'tbp_lv_deltaLB', 'tbp_lv_deltaLBnorm', 'tbp_lv_norm_color', 'tbp_lv_perimeterMM']
+                        df = df.drop(columns=columns_to_remove)
+                    except Exception as e:
+                        print(f"Error dropping columns for {year}: {e}")
+
+                    try:
+                        df['sex'] = df['sex'].map({'male': 0, 'female': 1})
+                        for value in df['anatom_site_general'].unique():
+                            if value not in anatom_site_general_encoding:
+                                anatom_site_general_encoding[value] = encoding_counter
+                                encoding_counter += 1
+                        df['anatom_site_general'] = df['anatom_site_general'].map(anatom_site_general_encoding)
+                        columns_order = ['isic_id', 'age_approx', 'sex'] + [col for col in df.columns if col not in ['isic_id', 'age_approx', 'sex', 'malignant']] + ['malignant']
+                        df = df[columns_order]
+                    except Exception as e:
+                        print(f"Error encoding columns for {year}: {e}")
+
+                    df = df.replace({np.nan: -1})
+
+                df = df.loc[:, ~df.columns.duplicated()]
+                df.to_csv(metadata_file, index=False)
+                print(f"Adjusted metadata for {year}.")
+            except Exception as e:
+                print(f"Error processing {year}: {e}")
 
 def main():
     base_dir = 'data'
@@ -226,10 +329,20 @@ def main():
                 print(f"Unzipping {file_path}...")
                 unzip_file(file_path, images_dir)
 
+    
+
 if __name__ == "__main__":
+    print("Downloading and extracting data...")
     main()
+    print("Data download and extraction completed.")
+    print("Renaming and cleaning up files...")
     rename_and_cleanup_files()
+    print("Renaming and cleaning up files completed.")
+    print("Combining loose metadata files...")
     combine_metadata()
+    print("Combining loose metadata files completed.")
+    print("Removing duplicates...")
+    adjusting_metadata()
     remove_duplicates()
     crop_resize_images()
 
