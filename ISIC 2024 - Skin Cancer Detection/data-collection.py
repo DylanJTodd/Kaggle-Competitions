@@ -5,7 +5,6 @@ import shutil
 import pandas as pd
 from PIL import Image
 
-# URLs and file paths
 data_files = {
     "2019": [
         ("images/images.zip", "https://isic-challenge-data.s3.amazonaws.com/2019/ISIC_2019_Training_Input.zip"),
@@ -35,14 +34,12 @@ def unzip_file(zip_path, extract_to):
     
     os.remove(zip_path)  # Delete the zip file after extraction
 
-    # Move files from subdirectories to the main images directory
     for root, dirs, files in os.walk(extract_to):
         if root != extract_to:
             for file in files:
                 if file.lower() not in ['license', 'attribution.txt']:
                     shutil.move(os.path.join(root, file), os.path.join(extract_to, file))
     
-    # Remove empty directories and unnecessary files
     for root, dirs, files in os.walk(extract_to, topdown=False):
         for file in files:
             if file.lower() in ['license', 'attribution.txt']:
@@ -50,7 +47,6 @@ def unzip_file(zip_path, extract_to):
         for dir in dirs:
             os.rmdir(os.path.join(root, dir))
 
-    # Handle csv and txt files
     handle_files(extract_to, os.path.join(extract_to, '../metadata'))
 
 def handle_files(images_dir, metadata_dir):
@@ -66,7 +62,6 @@ def move_file(file_path, metadata_dir):
     base_name = os.path.basename(file_path)
     new_file_path = os.path.join(metadata_dir, base_name)
     
-    # Rename file if it already exists
     if os.path.exists(new_file_path):
         base, ext = os.path.splitext(base_name)
         counter = 1
@@ -98,7 +93,6 @@ def rename_and_cleanup_files(base_dir='data'):
                     print(f"Removed '_downsampled' from isic_id in {year} metadata.")
                     
 def combine_metadata(base_dir='data'):
-    # Mapping of year to their respective Column A name
     column_a_mapping = {
         '2019': 'image',
         '2020': 'image_name',
@@ -111,33 +105,25 @@ def combine_metadata(base_dir='data'):
         
         combined_df = None
         
-        # Iterate through each metadata file in the metadata directory
         for file_name in os.listdir(metadata_dir):
             file_path = os.path.join(metadata_dir, file_name)
             
-            # Read the metadata file into a DataFrame
             df = pd.read_csv(file_path)
             
-            # Rename the 0th column to 'isic_id'
             column_a_name = column_a_mapping[year]
             df = df.rename(columns={column_a_name: 'isic_id'})
             
-            # For 2019, remove the '_downsampled' suffix from 'isic_id'
             if year == '2019':
                 df['isic_id'] = df['isic_id'].str.replace('_downsampled', '')
             
-            # If this is the first file, initialize combined_df with it
             if combined_df is None:
                 combined_df = df
             else:
-                # Merge based on 'isic_id' with an outer join
                 combined_df = pd.merge(combined_df, df, on='isic_id', how='outer')
         
-        # Save the combined DataFrame as metadata.csv in the respective metadata folder
         output_file_path = os.path.join(metadata_dir, 'metadata.csv')
         combined_df.to_csv(output_file_path, index=False)
         
-        # Remove the original metadata files after combining them
         for file_name in os.listdir(metadata_dir):
             if file_name != 'metadata.csv':  # Keep the newly created metadata.csv
                 file_path = os.path.join(metadata_dir, file_name)
@@ -145,7 +131,7 @@ def combine_metadata(base_dir='data'):
 
 def remove_duplicates(base_dir='data'):
     isic_id_set = set()
-    years = ['2024', '2020', '2019']  # process years in reverse order
+    years = ['2024', '2020', '2019']
     removed_entries = []
 
     for year in years:
@@ -182,31 +168,22 @@ def crop_resize_images(base_dir = 'data'):
     for year in years:
         images_directory = os.path.join(base_dir, year, "images")
         
-        # Process each image in the directory
         for file in os.listdir(images_directory):
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
                 image_path = os.path.join(images_directory, file)
                 
                 with Image.open(image_path) as img:
-                    # Get the dimensions of the image
                     width, height = img.size
 
-                    # Calculate the size of the square (it will be the smallest dimension)
                     square_size = min(width, height)
 
-                    # Calculate the coordinates for the center crop
                     left = (width - square_size) / 2
                     top = 0
                     right = (width + square_size) / 2
                     bottom = height
 
-                    # Crop the image
                     img_cropped = img.crop((left, top, right, bottom))
-
-                    # Resize the cropped image to 127x127
                     img_resized = img_cropped.resize((127, 127), Image.Resampling.LANCZOS)
-
-                    # Overwrite the original image with the resized image
                     img_resized.save(image_path)
 
 import os
@@ -296,6 +273,22 @@ def adjusting_metadata(base_dir='data'):
             except Exception as e:
                 print(f"Error processing {year}: {e}")
 
+def fill_missing_values(base_dir='data'):
+    for folder_name in os.listdir(base_dir):
+        folder_path = os.path.join(base_dir, folder_name)
+        
+        if os.path.isdir(folder_path):
+            metadata_file = os.path.join(folder_path, 'metadata', 'metadata.csv')
+            
+            if os.path.exists(metadata_file):
+                df = pd.read_csv(metadata_file)
+                df.fillna(-1, inplace=True)
+                
+                df.to_csv(metadata_file, index=False)
+                print(f'Processed and updated: {metadata_file}')
+            else:
+                print(f'metadata.csv not found in {folder_path}/metadata')
+
 def main():
     base_dir = 'data'
 
@@ -341,9 +334,15 @@ if __name__ == "__main__":
     print("Combining loose metadata files...")
     combine_metadata()
     print("Combining loose metadata files completed.")
-    print("Removing duplicates...")
+    print("Adjusting metadata and removing duplicates...")
     adjusting_metadata()
     remove_duplicates()
+    print("Adjusting metadata and removing duplicates completed.")
+    print("Cropping and resizing images.")
+    print("This may take a while...")
     crop_resize_images()
-
-    #Consider adding download to resnet weights file here and move to './data/resnet.pth'
+    print("Cropping and resizing images completed.")
+    print("Filling missing values with -1.")
+    fill_missing_values()
+    print("Filling missing values completed.")
+    print("Everything completed successfully.")
