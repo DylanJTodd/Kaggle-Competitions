@@ -1,23 +1,25 @@
 import os
 import pandas as pd
 import numpy as np
-from PIL import Image
 import cv2
-from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models
+import torchvision.transforms as transforms
+import torch.nn.functional as F
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import random
 
 # CONSTANTS
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 10
-IMG_SIZE = 224
-LOCAL_WEIGHTS_PATH = 'data/resnet.pth'
-CHECKPOINT_PATH = '.\data\checkpoints\checkpoint_2020.pth'
-FINAL_MODEL_PATH = os.path.join('data', 'final_model.pth')
+NUM_EPOCHS_2019 = 10
+NUM_EPOCHS_2020 = 10
+NUM_EPOCHS_2024 = 10
+IMG_SIZE = 127
+FINAL_MODEL_PATH = './data/final_model.pth'
 
 # Data Paths
 DATA_PATHS = {
@@ -26,147 +28,300 @@ DATA_PATHS = {
     2024: "data/2024"
 }
 
-# Custom Dataset Class
+def preprocess_image(image, target_size=(IMG_SIZE, IMG_SIZE)):
+    try:
+        image = cv2.resize(image, target_size)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = image / 255.0  # Normalize to [0, 1]
+        return image
+    except Exception:
+        return None
+
 class SkinCancerDataset(Dataset):
-    def __init__(self, img_dir, metadata_path, use_columns):
-        self.img_dir = img_dir
-        self.metadata = pd.read_csv(metadata_path)
-        self.use_columns = use_columns
-        
+    def __init__(self, df, transform=None, model_type=None):
+        self.df = df
+        self.transform = transform
+        self.model_type = model_type
+
     def __len__(self):
-        return len(self.metadata)
-    
+        return len(self.df)
+
     def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, f"{self.metadata.iloc[idx]['isic_id']}.jpg")
-        image = Image.open(img_path).convert("RGB")
-        image = np.array(image).astype(np.float32)
-        image = torch.tensor(image).permute(2, 0, 1) / 255.0
+        row = self.df.iloc[idx]
+        img_path = row['image_path']
+        image = cv2.imread(img_path)
+        image = preprocess_image(image)
 
-        metadata = self.metadata.loc[idx, self.use_columns].values.astype(np.float32)
-        metadata = torch.tensor(metadata)
+        if image is None:
+            return None  # Skip any problematic images that can't be processed
 
-        label = self.metadata.loc[idx, 'malignant'].astype(np.float32)
+        if self.transform:
+            image = self.transform(image)
+
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        metadata = torch.tensor([row['age_approx'], row['sex'], row['anatom_site_general']], dtype=torch.float32)
+        label = torch.tensor(row['malignant'], dtype=torch.float32)
+
+        # Handle model-specific behaviors
+        if self.model_type == 'sampling':
+            if label == 0.0 and random.random() < 0.8:
+                return None  # Skip the sample with 80% probability if it is not malignant
+            elif label == 1.0:
+                # Overrepresent malignant samples by returning multiple times
+                num_copies = random.randint(1, 3)
+                return [(image, metadata, label)] * num_copies
+
+        if self.model_type == 'augmentation' and label == 1.0:
+            # Augment the malignant samples
+            augment_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(10)
+            ])
+            image = augment_transform(image)
         
         return image, metadata, label
 
-# Load Data
-def load_data(data_path, batch_size, use_columns):
-    dataset = SkinCancerDataset(
-        os.path.join(data_path, 'images'),
-        os.path.join(data_path, 'metadata/metadata.csv'),
-        use_columns
-    )
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader
+    def collate_fn(self, batch):
+        # Custom collate_fn to handle None values and multiple copies for sampling model
+        batch = [item for sublist in batch for item in (sublist if isinstance(sublist, list) else [sublist])]
+        batch = [item for item in batch if item is not None]
+        
+        if len(batch) == 0:
+            return None, None, None
 
-# Define the Model
-class SkinCancerModel(nn.Module):
-    def __init__(self, num_metadata_features):
-        super(SkinCancerModel, self).__init__()
-        self.resnet = models.resnet50()
-        self.resnet.load_state_dict(torch.load(LOCAL_WEIGHTS_PATH))
-        
-        # Freeze initial layers
-        for param in list(self.resnet.parameters())[:int(len(list(self.resnet.parameters())) * 0.75)]:
-            param.requires_grad = False
-        
-        num_ftrs = self.resnet.fc.in_features
-        self.resnet.fc = nn.Identity()
-        self.fc1 = nn.Linear(num_ftrs + num_metadata_features, 512)
-        self.fc2 = nn.Linear(512, 1)
-        self.sigmoid = nn.Sigmoid()
-        
+        images, metadata, labels = zip(*batch)
+        return torch.stack(images), torch.stack(metadata), torch.stack(labels)
+
+class CNNModel(nn.Module):
+    def __init__(self):
+        super(CNNModel, self).__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.dropout = nn.Dropout(p=0.5)
+
+        self.fc1 = nn.Linear(256 * (IMG_SIZE // 16) * (IMG_SIZE // 16), 512)
+        self.fc2 = nn.Linear(512 + 3, 128)
+        self.fc3 = nn.Linear(128, 1)
+
     def forward(self, image, metadata):
-        img_features = self.resnet(image)
-        combined = torch.cat((img_features, metadata), dim=1)
-        x = torch.relu(self.fc1(combined))
-        x = self.sigmoid(self.fc2(x))
+        x = self.pool(F.relu(self.conv1(image)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = self.pool(F.relu(self.conv4(x)))
+
+        x = x.view(x.size(0), -1)
+        x = self.dropout(F.relu(self.fc1(x)))
+
+        x = torch.cat((x, metadata), dim=1)
+        x = F.relu(self.fc2(x))
+        x = torch.sigmoid(self.fc3(x))
+
         return x
 
-# Training Function
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=NUM_EPOCHS, checkpoint_path=None):
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path))
-        print(f"Loaded checkpoint from {checkpoint_path}")
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+def load_data(year):
+    data_path = DATA_PATHS[year]
+    metadata_path = os.path.join(data_path, 'metadata', 'metadata.csv')
+    df = pd.read_csv(metadata_path)
+    # Correcting image paths to include '/images/' subdirectory
+    df['image_path'] = df['isic_id'].apply(lambda x: os.path.join(data_path, 'images', f'{x}.jpg'))
+    return df
+
+def split_2024_data(df):
+    parts = np.array_split(df, 3)
+    return parts
+
+def train_model(model, dataloaders, criterion, optimizer, num_epochs, device):
+    model = model.to(device)
     for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for images, metadata, labels in train_loader:
-            images, metadata, labels = images.to(device), metadata.to(device), labels.to(device)
+        print(f'Epoch {epoch+1}/{num_epochs}')
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
 
-            optimizer.zero_grad()
-            outputs = model(images, metadata).squeeze()
+            running_loss = 0.0
+            corrects = 0
+            total = 0
+
+            for inputs, metadata, labels in tqdm(dataloaders[phase]):
+                if inputs is None:
+                    continue
+                inputs = inputs.to(device)
+                metadata = metadata.to(device)
+                labels = labels.to(device).view(-1, 1)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs, metadata)
+
+                    loss = criterion(outputs, labels)
+                    preds = outputs > 0.5
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                corrects += torch.sum(preds == labels.data)
+                total += labels.size(0)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = corrects.double() / total
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+    return model
+
+def evaluate_model(model, test_loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    corrects = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, metadata, labels in tqdm(test_loader):
+            if inputs is None:
+                continue
+            inputs = inputs.to(device)
+            metadata = metadata.to(device)
+            labels = labels.to(device).view(-1, 1)
+
+            outputs = model(inputs, metadata)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            preds = outputs > 0.5
 
-            running_loss += loss.item()
-            predicted = outputs.round()
+            running_loss += loss.item() * inputs.size(0)
+            corrects += torch.sum(preds == labels.data)
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
 
-        train_accuracy = 100 * correct / total
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader)}, Accuracy: {train_accuracy}%')
+    loss = running_loss / len(test_loader.dataset)
+    acc = corrects.double() / total
+    print(f'Test Loss: {loss:.4f} Acc: {acc:.4f}')
+    return loss, acc
 
-        model.eval()
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for images, metadata, labels in test_loader:
-                images, metadata, labels = images.to(device), metadata.to(device), labels.to(device)
-                outputs = model(images, metadata).squeeze()
-                predicted = outputs.round()
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
+def train_ensemble_models(train_dfs, val_dfs, test_parts):
+    models = {
+        "sampling": CNNModel(),
+        "focal": CNNModel(),
+        "augment": CNNModel()
+    }
 
-        val_accuracy = 100 * val_correct / val_total
-        print(f'Validation Accuracy: {val_accuracy}%')
+    criterion_focal = FocalLoss()
+    criterion_standard = nn.BCELoss()
 
-    if checkpoint_path:
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"Checkpoint saved at {checkpoint_path}")
+    optimizers = {
+        "sampling": optim.Adam(models["sampling"].parameters(), lr=LEARNING_RATE),
+        "focal": optim.Adam(models["focal"].parameters(), lr=LEARNING_RATE),
+        "augment": optim.Adam(models["augment"].parameters(), lr=LEARNING_RATE)
+    }
 
-# Instantiate Model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
+    best_models = {
+        "sampling": None,
+        "focal": None,
+        "augment": None
+    }
+    
+    best_accuracies = {
+        "sampling": 0.0,
+        "focal": 0.0,
+        "augment": 0.0
+    }
 
-use_columns = ['age_approx', 'sex', 'anatom_site_general']
-criterion = nn.BCELoss()
+    for model_name, model in models.items():
+        print(f"Training {model_name.capitalize()} Model...")
+        
+        # Use different criterion for focal model
+        criterion = criterion_focal if model_name == 'focal' else criterion_standard
 
-if not os.path.exists(CHECKPOINT_PATH):
-    # Training on 2019 Data
-    train_loader_2019, test_loader_2019 = load_data(DATA_PATHS[2019], BATCH_SIZE, use_columns)
-    model_2019_2020 = SkinCancerModel(num_metadata_features=len(use_columns)).to(device)  # Using metadata features
-    optimizer = optim.Adam(model_2019_2020.parameters(), lr=LEARNING_RATE)
+        for year in [2019, 2020]:
+            # Configure dataloaders for this model and year
+            train_dataset = SkinCancerDataset(train_dfs[year], transform=None, model_type=model_name)
+            val_dataset = SkinCancerDataset(val_dfs[year], transform=None, model_type=model_name)
 
-    print("Training on 2019 Data")
-    train_model(model_2019_2020, train_loader_2019, test_loader_2019, criterion, optimizer)
+            dataloaders = {
+                'train': DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=train_dataset.collate_fn),
+                'val': DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=train_dataset.collate_fn)
+            }
 
-    # Training on 2020 Data
-    train_loader_2020, test_loader_2020 = load_data(DATA_PATHS[2020], BATCH_SIZE, use_columns)
+            # Train and fine-tune on each year's data
+            model = train_model(model, dataloaders, criterion, optimizers[model_name], NUM_EPOCHS_2019 if year == 2019 else NUM_EPOCHS_2020, device)
+        
+        # Training and testing on 2024 data with cross-validation
+        for i in range(3):
+            # Prepare training and testing splits for 2024 data
+            test_df_2024 = test_parts[i]
+            train_df_2024 = pd.concat([test_parts[j] for j in range(3) if j != i])
 
-    print("Training on 2020 Data")
-    train_model(model_2019_2020, train_loader_2020, test_loader_2020, criterion, optimizer, checkpoint_path=CHECKPOINT_PATH)
+            train_dataset_2024 = SkinCancerDataset(train_df_2024, transform=None, model_type=model_name)
+            test_dataset_2024 = SkinCancerDataset(test_df_2024, transform=None, model_type=model_name)
 
-model_2024 = SkinCancerModel(num_metadata_features=len(use_columns)).to(device)
-model_2024.load_state_dict(torch.load(CHECKPOINT_PATH))
-print("Loaded model from checkpoint_2020.pth")
+            dataloaders_2024 = {
+                'train': DataLoader(train_dataset_2024, batch_size=BATCH_SIZE, shuffle=True, collate_fn=train_dataset_2024.collate_fn),
+                'val': DataLoader(test_dataset_2024, batch_size=BATCH_SIZE, shuffle=False, collate_fn=train_dataset_2024.collate_fn)
+            }
 
-train_loader_2024, test_loader_2024 = load_data(DATA_PATHS[2024], BATCH_SIZE, use_columns)
-fine_tune_optimizer = optim.Adam(model_2024.parameters(), lr=LEARNING_RATE / 10)
+            # Train on 2/3 of 2024 data
+            model = train_model(model, dataloaders_2024, criterion, optimizers[model_name], NUM_EPOCHS_2024, device)
 
-print("Training on 2024 Data")
-train_model(model_2024, train_loader_2024, test_loader_2024, criterion, fine_tune_optimizer)
+            # Evaluate on the remaining 1/3 of 2024 data
+            _, accuracy = evaluate_model(model, dataloaders_2024['val'], criterion, device)
+            
+            # Save the model if it has the best accuracy so far
+            if accuracy > best_accuracies[model_name]:
+                best_accuracies[model_name] = accuracy
+                best_models[model_name] = model.state_dict()
+                torch.save(model.state_dict(), f'models/{model_name.capitalize()}_best_model.pth')
+                print(f'New best {model_name} model saved with accuracy: {accuracy:.4f}')
+    
+    # Return the best models' state_dicts
+    return best_models
 
-# Save final model
-torch.save(model_2024.state_dict(), FINAL_MODEL_PATH)
-print(f"Final model saved at {FINAL_MODEL_PATH}")
+def main():
+    train_dfs = {}
+    val_dfs = {}
+    test_parts = []
 
-print("Training complete.")
+    # Load and split data by year
+    for year in [2019, 2020]:
+        df = load_data(year)
+        train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+        train_dfs[year] = train_df
+        val_dfs[year] = val_df  # Validation data
+
+    # Load and split the 2024 data into 3 parts
+    df_2024 = load_data(2024)
+    test_parts = split_2024_data(df_2024)  # Store the split parts in a single list
+
+    # Train ensemble models
+    best_models = train_ensemble_models(train_dfs, val_dfs, test_parts)
+
+    # Save the final models after training on all data
+    for model_name, model_state in best_models.items():
+        torch.save(model_state, f'models/{model_name}_final_model.pth')
+    
+    print("Training complete. Models saved.")
+
+if __name__ == "__main__":
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    main()
+
+    #Not supposed to have 3 loops for 2024 data, and split it into 3. What was supposed to happen is for the original data to train on,
+    #split it into 3 parts, and train on 2 parts and test on the remaining part.
